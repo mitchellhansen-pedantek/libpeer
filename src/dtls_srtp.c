@@ -11,6 +11,17 @@
 #include "config.h"
 #include "utils.h"
 
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/ssl_cookie.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/x509_csr.h>
+#include <mbedtls/timing.h>
+
+#include <srtp2/srtp.h>
+
 typedef struct DtlsHeader DtlsHeader;
 
 struct DtlsHeader {
@@ -24,6 +35,23 @@ struct DtlsHeader {
 
 }__attribute__((packed));
 
+typedef struct {
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_config conf;
+  mbedtls_ssl_cookie_ctx cookie_ctx;
+  mbedtls_x509_crt cert;
+  mbedtls_pk_context pkey;
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+} MbedtlsContext;
+
+
+typedef struct {
+  srtp_policy_t remote_policy;
+  srtp_policy_t local_policy;
+  srtp_t srtp_in;
+  srtp_t srtp_out;
+} SRTPContext;
 
 int dtls_srtp_udp_send(void *ctx, const uint8_t *buf, size_t len) {
 
@@ -84,6 +112,7 @@ static int dtls_srtp_cert_verify(void *data, mbedtls_x509_crt *crt, int depth, u
 
 static int dtls_srtp_selfsign_cert(DtlsSrtp *dtls_srtp) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
 
   mbedtls_x509write_cert crt;
@@ -99,23 +128,23 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp *dtls_srtp) {
     return -1;
   }
 
-  mbedtls_ctr_drbg_seed(&dtls_srtp->ctr_drbg, mbedtls_entropy_func, &dtls_srtp->entropy, (const unsigned char *) pers, strlen(pers));
+  mbedtls_ctr_drbg_seed(&mbedtls_ctx->ctr_drbg, mbedtls_entropy_func, &mbedtls_ctx->entropy, (const unsigned char *) pers, strlen(pers));
 
-  mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+  mbedtls_pk_setup(&mbedtls_ctx->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
  
-  mbedtls_rsa_gen_key(mbedtls_pk_rsa(dtls_srtp->pkey), mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg, RSA_KEY_LENGTH, 65537);
+  mbedtls_rsa_gen_key(mbedtls_pk_rsa(mbedtls_ctx->pkey), mbedtls_ctr_drbg_random, &mbedtls_ctx->ctr_drbg, RSA_KEY_LENGTH, 65537);
 
   mbedtls_x509write_crt_init(&crt);
 
-  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
+  mbedtls_x509write_crt_set_subject_key(&crt, &mbedtls_ctx->pkey);
 
   mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
 
   mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
 
-  mbedtls_x509write_crt_set_subject_key(&crt, &dtls_srtp->pkey);
+  mbedtls_x509write_crt_set_subject_key(&crt, &mbedtls_ctx->pkey);
 
-  mbedtls_x509write_crt_set_issuer_key(&crt, &dtls_srtp->pkey);
+  mbedtls_x509write_crt_set_issuer_key(&crt, &mbedtls_ctx->pkey);
 
   mbedtls_x509write_crt_set_subject_name(&crt, "CN=dtls_srtp");
 
@@ -125,14 +154,14 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp *dtls_srtp) {
 
   mbedtls_x509write_crt_set_validity(&crt, "20180101000000", "20280101000000");
 
-  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2*RSA_KEY_LENGTH, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2*RSA_KEY_LENGTH, mbedtls_ctr_drbg_random, &mbedtls_ctx->ctr_drbg);
 
   if (ret < 0) {
 
     LOGE("mbedtls_x509write_crt_pem failed");
   }
 
-  mbedtls_x509_crt_parse(&dtls_srtp->cert, cert_buf, 2*RSA_KEY_LENGTH);
+  mbedtls_x509_crt_parse(&mbedtls_ctx->cert, cert_buf, 2*RSA_KEY_LENGTH);
 
   mbedtls_x509write_crt_free(&crt);
 
@@ -157,13 +186,16 @@ int dtls_srtp_init(DtlsSrtp *dtls_srtp, DtlsSrtpRole role, void *user_data) {
   dtls_srtp->udp_send = dtls_srtp_udp_send;
   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
 
-  mbedtls_ssl_config_init(&dtls_srtp->conf);
-  mbedtls_ssl_init(&dtls_srtp->ssl);
+  dtls_srtp->mbedtls_ctx = malloc(sizeof(MbedtlsContext));
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
 
-  mbedtls_x509_crt_init(&dtls_srtp->cert);
-  mbedtls_pk_init(&dtls_srtp->pkey);
-  mbedtls_entropy_init(&dtls_srtp->entropy);
-  mbedtls_ctr_drbg_init(&dtls_srtp->ctr_drbg);
+  mbedtls_ssl_config_init(&mbedtls_ctx->conf);
+  mbedtls_ssl_init(&mbedtls_ctx->ssl);
+
+  mbedtls_x509_crt_init(&mbedtls_ctx->cert);
+  mbedtls_pk_init(&mbedtls_ctx->pkey);
+  mbedtls_entropy_init(&mbedtls_ctx->entropy);
+  mbedtls_ctr_drbg_init(&mbedtls_ctx->ctr_drbg);
 
   dtls_srtp_selfsign_cert(dtls_srtp);
 
@@ -174,67 +206,70 @@ int dtls_srtp_init(DtlsSrtp *dtls_srtp, DtlsSrtpRole role, void *user_data) {
   mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 #endif
 
-  mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
+  mbedtls_ssl_conf_ca_chain(&mbedtls_ctx->conf, &mbedtls_ctx->cert, NULL);
 
-  mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
+  mbedtls_ssl_conf_own_cert(&mbedtls_ctx->conf, &mbedtls_ctx->cert, &mbedtls_ctx->pkey);
 
-  mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+  mbedtls_ssl_conf_rng(&mbedtls_ctx->conf, mbedtls_ctr_drbg_random, &mbedtls_ctx->ctr_drbg);
 
-  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+  mbedtls_ssl_conf_read_timeout(&mbedtls_ctx->conf, 1000);
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
 
-    mbedtls_ssl_config_defaults(&dtls_srtp->conf,
+    mbedtls_ssl_config_defaults(&mbedtls_ctx->conf,
      MBEDTLS_SSL_IS_SERVER,
      MBEDTLS_SSL_TRANSPORT_DATAGRAM,
      MBEDTLS_SSL_PRESET_DEFAULT);
 
-    mbedtls_ssl_cookie_init(&dtls_srtp->cookie_ctx);
+    mbedtls_ssl_cookie_init(&mbedtls_ctx->cookie_ctx);
 
-    mbedtls_ssl_cookie_setup(&dtls_srtp->cookie_ctx, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+    mbedtls_ssl_cookie_setup(&mbedtls_ctx->cookie_ctx, mbedtls_ctr_drbg_random, &mbedtls_ctx->ctr_drbg);
 
-    mbedtls_ssl_conf_dtls_cookies(&dtls_srtp->conf, mbedtls_ssl_cookie_write, mbedtls_ssl_cookie_check, &dtls_srtp->cookie_ctx);
+    mbedtls_ssl_conf_dtls_cookies(&mbedtls_ctx->conf, mbedtls_ssl_cookie_write, mbedtls_ssl_cookie_check, &mbedtls_ctx->cookie_ctx);
 
   } else {
 
-    mbedtls_ssl_config_defaults(&dtls_srtp->conf,
+    mbedtls_ssl_config_defaults(&mbedtls_ctx->conf,
      MBEDTLS_SSL_IS_CLIENT,
      MBEDTLS_SSL_TRANSPORT_DATAGRAM,
      MBEDTLS_SSL_PRESET_DEFAULT);
   }
 
-  dtls_srtp_x509_digest(&dtls_srtp->cert, dtls_srtp->local_fingerprint);
+  dtls_srtp_x509_digest(&mbedtls_ctx->cert, dtls_srtp->local_fingerprint);
 
-  LOGD("local fingerprint: %s", dtls_srtp->local_fingerprint);
+  LOGD("local fingerprint: %s", mbedtls_ctx->local_fingerprint);
 
-  mbedtls_ssl_conf_dtls_srtp_protection_profiles(&dtls_srtp->conf, default_profiles);
+  mbedtls_ssl_conf_dtls_srtp_protection_profiles(&mbedtls_ctx->conf, default_profiles);
 
-  mbedtls_ssl_conf_srtp_mki_value_supported(&dtls_srtp->conf, MBEDTLS_SSL_DTLS_SRTP_MKI_UNSUPPORTED);
+  mbedtls_ssl_conf_srtp_mki_value_supported(&mbedtls_ctx->conf, MBEDTLS_SSL_DTLS_SRTP_MKI_UNSUPPORTED);
 
-  mbedtls_ssl_setup(&dtls_srtp->ssl, &dtls_srtp->conf);
+  mbedtls_ssl_setup(&mbedtls_ctx->ssl, &mbedtls_ctx->conf);
 
   return 0;
 }
 
 void dtls_srtp_deinit(DtlsSrtp *dtls_srtp) {
 
-  mbedtls_ssl_free(&dtls_srtp->ssl);
-  mbedtls_ssl_config_free(&dtls_srtp->conf);
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
+  SRTPContext *srtp_ctx = (SRTPContext *)dtls_srtp->srtp_ctx;
 
-  mbedtls_x509_crt_free(&dtls_srtp->cert);
-  mbedtls_pk_free(&dtls_srtp->pkey);
-  mbedtls_entropy_free(&dtls_srtp->entropy);
-  mbedtls_ctr_drbg_free(&dtls_srtp->ctr_drbg);
+  mbedtls_ssl_free(&mbedtls_ctx->ssl);
+  mbedtls_ssl_config_free(&mbedtls_ctx->conf);
+
+  mbedtls_x509_crt_free(&mbedtls_ctx->cert);
+  mbedtls_pk_free(&mbedtls_ctx->pkey);
+  mbedtls_entropy_free(&mbedtls_ctx->entropy);
+  mbedtls_ctr_drbg_free(&mbedtls_ctx->ctr_drbg);
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
 
-    mbedtls_ssl_cookie_free(&dtls_srtp->cookie_ctx);
+    mbedtls_ssl_cookie_free(&mbedtls_ctx->cookie_ctx);
   }
 
   if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
 
-    srtp_dealloc(dtls_srtp->srtp_in);
-    srtp_dealloc(dtls_srtp->srtp_out);
+    srtp_dealloc(srtp_ctx->srtp_in);
+    srtp_dealloc(srtp_ctx->srtp_out);
   }
 }
 
@@ -245,6 +280,7 @@ static void dtls_srtp_key_derivation(void *context, mbedtls_ssl_key_export_type 
  mbedtls_tls_prf_types tls_prf_type) {
 
   DtlsSrtp *dtls_srtp = (DtlsSrtp *) context;
+  SRTPContext *srtp_ctx = (SRTPContext *)dtls_srtp->srtp_ctx;
 
   int ret;
 
@@ -289,19 +325,19 @@ static void dtls_srtp_key_derivation(void *context, mbedtls_ssl_key_export_type 
 
   // derive inbounds keys
 
-  memset(&dtls_srtp->remote_policy, 0, sizeof(dtls_srtp->remote_policy));
+  memset(&srtp_ctx->remote_policy, 0, sizeof(srtp_ctx->remote_policy));
 
-  srtp_crypto_policy_set_rtp_default(&dtls_srtp->remote_policy.rtp); 
-  srtp_crypto_policy_set_rtcp_default(&dtls_srtp->remote_policy.rtcp);
+  srtp_crypto_policy_set_rtp_default(&srtp_ctx->remote_policy.rtp); 
+  srtp_crypto_policy_set_rtcp_default(&srtp_ctx->remote_policy.rtcp);
 
   memcpy(dtls_srtp->remote_policy_key, key_material, SRTP_MASTER_KEY_LENGTH);
   memcpy(dtls_srtp->remote_policy_key + SRTP_MASTER_KEY_LENGTH, key_material + SRTP_MASTER_KEY_LENGTH + SRTP_MASTER_KEY_LENGTH, SRTP_MASTER_SALT_LENGTH);
 
-  dtls_srtp->remote_policy.ssrc.type = ssrc_any_inbound;
-  dtls_srtp->remote_policy.key = dtls_srtp->remote_policy_key;
-  dtls_srtp->remote_policy.next = NULL;
+  srtp_ctx->remote_policy.ssrc.type = ssrc_any_inbound;
+  srtp_ctx->remote_policy.key = dtls_srtp->remote_policy_key;
+  srtp_ctx->remote_policy.next = NULL;
 
-  if (srtp_create(&dtls_srtp->srtp_in, &dtls_srtp->remote_policy) != srtp_err_status_ok) {
+  if (srtp_create(&srtp_ctx->srtp_in, &srtp_ctx->remote_policy) != srtp_err_status_ok) {
 
     LOGD("Error creating inbound SRTP session for component");
     return;
@@ -310,19 +346,19 @@ static void dtls_srtp_key_derivation(void *context, mbedtls_ssl_key_export_type 
   LOGI("Created inbound SRTP session");
 
   // derive outbounds keys
-  memset(&dtls_srtp->local_policy, 0, sizeof(dtls_srtp->local_policy));
+  memset(&srtp_ctx->local_policy, 0, sizeof(srtp_ctx->local_policy));
 
-  srtp_crypto_policy_set_rtp_default(&dtls_srtp->local_policy.rtp);
-  srtp_crypto_policy_set_rtcp_default(&dtls_srtp->local_policy.rtcp);
+  srtp_crypto_policy_set_rtp_default(&srtp_ctx->local_policy.rtp);
+  srtp_crypto_policy_set_rtcp_default(&srtp_ctx->local_policy.rtcp);
 
   memcpy(dtls_srtp->local_policy_key, key_material + SRTP_MASTER_KEY_LENGTH, SRTP_MASTER_KEY_LENGTH);
   memcpy(dtls_srtp->local_policy_key + SRTP_MASTER_KEY_LENGTH, key_material + SRTP_MASTER_KEY_LENGTH + SRTP_MASTER_KEY_LENGTH + SRTP_MASTER_SALT_LENGTH, SRTP_MASTER_SALT_LENGTH);
 
-  dtls_srtp->local_policy.ssrc.type = ssrc_any_outbound;
-  dtls_srtp->local_policy.key = dtls_srtp->local_policy_key;
-  dtls_srtp->local_policy.next = NULL;
+  srtp_ctx->local_policy.ssrc.type = ssrc_any_outbound;
+  srtp_ctx->local_policy.key = dtls_srtp->local_policy_key;
+  srtp_ctx->local_policy.next = NULL;
 
-  if (srtp_create(&dtls_srtp->srtp_out, &dtls_srtp->local_policy) != srtp_err_status_ok) {
+  if (srtp_create(&srtp_ctx->srtp_out, &srtp_ctx->local_policy) != srtp_err_status_ok) {
 
     LOGE("Error creating outbound SRTP session");
     return;
@@ -334,19 +370,20 @@ static void dtls_srtp_key_derivation(void *context, mbedtls_ssl_key_export_type 
 
 static int dtls_srtp_do_handshake(DtlsSrtp *dtls_srtp) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
   
   static mbedtls_timing_delay_context timer; 
 
-  mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+  mbedtls_ssl_set_timer_cb(&mbedtls_ctx->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
 
-  mbedtls_ssl_set_export_keys_cb(&dtls_srtp->ssl, dtls_srtp_key_derivation, dtls_srtp);
+  mbedtls_ssl_set_export_keys_cb(&mbedtls_ctx->ssl, dtls_srtp_key_derivation, dtls_srtp);
 
-  mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
+  mbedtls_ssl_set_bio(&mbedtls_ctx->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
   
   do {
 
-    ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
+    ret = mbedtls_ssl_handshake(&mbedtls_ctx->ssl);
 
   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
 
@@ -355,15 +392,16 @@ static int dtls_srtp_do_handshake(DtlsSrtp *dtls_srtp) {
 
 static int dtls_srtp_handshake_server(DtlsSrtp *dtls_srtp) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
 
   while (1) {
 
     unsigned char client_ip[] = "test";
 
-    mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+    mbedtls_ssl_session_reset(&mbedtls_ctx->ssl);
 
-    mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, sizeof(client_ip)); 
+    mbedtls_ssl_set_client_transport_id(&mbedtls_ctx->ssl, client_ip, sizeof(client_ip)); 
 
     ret = dtls_srtp_do_handshake(dtls_srtp);
 
@@ -390,6 +428,7 @@ static int dtls_srtp_handshake_server(DtlsSrtp *dtls_srtp) {
 
 static int dtls_srtp_handshake_client(DtlsSrtp *dtls_srtp) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
 
   ret = dtls_srtp_do_handshake(dtls_srtp);
@@ -401,7 +440,7 @@ static int dtls_srtp_handshake_client(DtlsSrtp *dtls_srtp) {
 
   int flags;
 
-  if ((flags = mbedtls_ssl_get_verify_result(&dtls_srtp->ssl)) != 0) {
+  if ((flags = mbedtls_ssl_get_verify_result(&mbedtls_ctx->ssl)) != 0) {
 #if !defined(MBEDTLS_X509_REMOVE_INFO)
     char vrfy_buf[512];
 #endif
@@ -423,6 +462,7 @@ static int dtls_srtp_handshake_client(DtlsSrtp *dtls_srtp) {
 
 int dtls_srtp_handshake(DtlsSrtp *dtls_srtp, Address *addr) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
 
   dtls_srtp->remote_addr = addr;
@@ -453,18 +493,21 @@ int dtls_srtp_handshake(DtlsSrtp *dtls_srtp, Address *addr) {
 #endif
 
   mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
-  mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
+  mbedtls_ssl_get_dtls_srtp_negotiation_result(&mbedtls_ctx->ssl, &dtls_srtp_negotiation_result);
 
   return ret;
 }
 
 void dtls_srtp_reset_session(DtlsSrtp *dtls_srtp) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
+  SRTPContext* srtp_ctx = (SRTPContext*)dtls_srtp->srtp_ctx;
+
   if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
 
-    srtp_dealloc(dtls_srtp->srtp_in);
-    srtp_dealloc(dtls_srtp->srtp_out);
-    mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+    srtp_dealloc(srtp_ctx->srtp_in);
+    srtp_dealloc(srtp_ctx->srtp_out);
+    mbedtls_ssl_session_reset(&mbedtls_ctx->ssl);
   }
 
   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
@@ -472,11 +515,12 @@ void dtls_srtp_reset_session(DtlsSrtp *dtls_srtp) {
 
 int dtls_srtp_write(DtlsSrtp *dtls_srtp, const unsigned char *buf, size_t len) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
 
   do {
 
-    ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
+    ret = mbedtls_ssl_write(&mbedtls_ctx->ssl, buf, len);
 
   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
   return ret;
@@ -484,13 +528,14 @@ int dtls_srtp_write(DtlsSrtp *dtls_srtp, const unsigned char *buf, size_t len) {
 
 int dtls_srtp_read(DtlsSrtp *dtls_srtp, unsigned char *buf, size_t len) {
 
+  MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
   int ret;
 
   memset(buf, 0, len);
 
   do {
 
-    ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
+    ret = mbedtls_ssl_read(&mbedtls_ctx->ssl, buf, len);
 
   } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
 
@@ -509,21 +554,25 @@ int dtls_srtp_probe(uint8_t *buf) {
 
 void dtls_srtp_decrypt_rtp_packet(DtlsSrtp *dtls_srtp, uint8_t *packet, int *bytes) {
 
-  srtp_unprotect(dtls_srtp->srtp_in, packet, bytes);
+  SRTPContext* srtp_ctx = (SRTPContext*)dtls_srtp->srtp_ctx;
+  srtp_unprotect(srtp_ctx->srtp_in, packet, bytes);
 }
 
 void dtls_srtp_decrypt_rtcp_packet(DtlsSrtp *dtls_srtp, uint8_t *packet, int *bytes) {
 
-  srtp_unprotect_rtcp(dtls_srtp->srtp_in, packet, bytes);
+  SRTPContext* srtp_ctx = (SRTPContext*)dtls_srtp->srtp_ctx;
+  srtp_unprotect_rtcp(srtp_ctx->srtp_in, packet, bytes);
 }
 
 void dtls_srtp_encrypt_rtp_packet(DtlsSrtp *dtls_srtp, uint8_t *packet, int *bytes) {
 
-  srtp_protect(dtls_srtp->srtp_out, packet, bytes);
+  SRTPContext* srtp_ctx = (SRTPContext*)dtls_srtp->srtp_ctx;
+  srtp_protect(srtp_ctx->srtp_out, packet, bytes);
 }
 
 void dtls_srtp_encrypt_rctp_packet(DtlsSrtp *dtls_srtp, uint8_t *packet, int *bytes) {
 
-  srtp_protect_rtcp(dtls_srtp->srtp_out, packet, bytes);
+  SRTPContext* srtp_ctx = (SRTPContext*)dtls_srtp->srtp_ctx;
+  srtp_protect_rtcp(srtp_ctx->srtp_out, packet, bytes);
 }
 

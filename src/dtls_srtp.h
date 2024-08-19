@@ -4,17 +4,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/ssl_cookie.h>
-#include <mbedtls/pk.h>
-#include <mbedtls/x509_crt.h>
-#include <mbedtls/x509_csr.h>
-#include <mbedtls/timing.h>
-
-#include <srtp2/srtp.h>
-
 #include "address.h"
 
 #define SRTP_MASTER_KEY_LENGTH  16
@@ -40,19 +29,11 @@ typedef enum DtlsSrtpState {
 typedef struct DtlsSrtp {
 
   // MbedTLS
-  mbedtls_ssl_context ssl;
-  mbedtls_ssl_config conf;
-  mbedtls_ssl_cookie_ctx cookie_ctx;
-  mbedtls_x509_crt cert;
-  mbedtls_pk_context pkey;
-  mbedtls_entropy_context entropy;
-  mbedtls_ctr_drbg_context ctr_drbg;
+  void* mbedtls_ctx;
 
   // SRTP
-  srtp_policy_t remote_policy;
-  srtp_policy_t local_policy;
-  srtp_t srtp_in;
-  srtp_t srtp_out;
+  void* srtp_ctx;
+
   unsigned char remote_policy_key[SRTP_MASTER_KEY_LENGTH + SRTP_MASTER_SALT_LENGTH];
   unsigned char local_policy_key[SRTP_MASTER_KEY_LENGTH + SRTP_MASTER_SALT_LENGTH];
 
