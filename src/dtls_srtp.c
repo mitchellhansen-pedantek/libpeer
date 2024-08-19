@@ -189,6 +189,8 @@ int dtls_srtp_init(DtlsSrtp *dtls_srtp, DtlsSrtpRole role, void *user_data) {
   dtls_srtp->mbedtls_ctx = malloc(sizeof(MbedtlsContext));
   MbedtlsContext *mbedtls_ctx = (MbedtlsContext *)dtls_srtp->mbedtls_ctx;
 
+  dtls_srtp->srtp_ctx = malloc(sizeof(SRTPContext));
+
   mbedtls_ssl_config_init(&mbedtls_ctx->conf);
   mbedtls_ssl_init(&mbedtls_ctx->ssl);
 
@@ -271,6 +273,9 @@ void dtls_srtp_deinit(DtlsSrtp *dtls_srtp) {
     srtp_dealloc(srtp_ctx->srtp_in);
     srtp_dealloc(srtp_ctx->srtp_out);
   }
+
+  free(dtls_srtp->mbedtls_ctx);
+  free(dtls_srtp->srtp_ctx);
 }
 
 static void dtls_srtp_key_derivation(void *context, mbedtls_ssl_key_export_type secret_type,
