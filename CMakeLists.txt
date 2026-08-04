@@ -85,18 +85,26 @@ ExternalProject_Add(cjson
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
 )
 
+# DTLS-SRTP is enabled through mbedtls's own MBEDTLS_USER_CONFIG_FILE hook
+# (see mbedtls_user_config.h). mbedtls's CMake takes this as a FILEPATH cache
+# variable and emits the compile definition itself, so nothing here has to
+# quote a C string.
+#
+# This replaced a READ/string(REPLACE)/WRITE that rewrote the vendored
+# mbedtls_config.h in the source tree on every configure. It left the submodule
+# permanently dirty, and — because the content variable was expanded unquoted —
+# CMake read every `;` in the header as a list separator and dropped it,
+# corrupting 21 unrelated lines for the sake of one define.
 ExternalProject_Add(mbedtls
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls
   CMAKE_ARGS
     -DCMAKE_C_FLAGS="-fPIC"
     -DENABLE_TESTING=off
     -DENABLE_PROGRAMS=off
+    -DMBEDTLS_USER_CONFIG_FILE=${CMAKE_CURRENT_SOURCE_DIR}/mbedtls_user_config.h
     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
 )
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include/mbedtls/mbedtls_config.h INPUT_CONTENT)
-string(REPLACE "//#define MBEDTLS_SSL_DTLS_SRTP" "#define MBEDTLS_SSL_DTLS_SRTP" MODIFIED_CONTENT ${INPUT_CONTENT})
-file(WRITE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include/mbedtls/mbedtls_config.h ${MODIFIED_CONTENT})
 
 ExternalProject_Add(srtp2
   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libsrtp
