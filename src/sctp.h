@@ -164,6 +164,13 @@ typedef struct Sctp {
   /* Thread safety for usrsctp operations */
   pthread_mutex_t send_mutex;
 
+  /* EAGAIN/EWOULDBLOCK log-rate-limit state for sctp_outgoing_data() (see
+   * sctp_eagain_gate.h). Both fields are only ever touched while holding
+   * send_mutex, so no separate lock is needed. Sctp is embedded in a
+   * calloc'd PeerConnection, so both start zeroed. */
+  int64_t  send_eagain_last_log_ns;
+  uint64_t send_eagain_suppressed;
+
   /* datachannel */
   void (*onmessage)(char* msg, size_t len, void* userdata, uint16_t sid);
   void (*onopen)(void* userdata);
