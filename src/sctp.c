@@ -1,12 +1,26 @@
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "dtls_srtp.h"
 #include "sctp.h"
+#include "sctp_eagain_gate.h"
 #include "utils.h"
 #if CONFIG_USE_USRSCTP
 #include <usrsctp.h>
 #endif
+
+/* Minimum spacing between folded "sctp sendv backpressure" summary lines.
+ * EAGAIN under sustained congestion recurs at up to ~4kHz (the segment-export
+ * retry loop in datachannel_hls.c polls every 250us) — see sctp_eagain_gate.h. */
+#define SCTP_EAGAIN_LOG_INTERVAL_NS (1000000000LL) /* 1s */
+
+static int64_t sctp_mono_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
 
 static const uint32_t crc32c_table[256] = {
     0x00000000L, 0xF26B8303L, 0xE13B70F7L, 0x1350F3F4L,
@@ -138,19 +152,57 @@ int sctp_outgoing_data(Sctp* sctp, char* buf, size_t len, SctpDataPpid ppid, uin
   res = usrsctp_sendv(sctp->sock, buf, len, NULL, 0, &spa, sizeof(spa), SCTP_SENDV_SPA, 0);
   if (res < 0) {
     int saved_errno = errno;
-    /* Query SCTP status to understand what's happening */
-    struct sctp_status status;
-    socklen_t status_len = sizeof(status);
-    memset(&status, 0, sizeof(status));
-    if (usrsctp_getsockopt(sctp->sock, IPPROTO_SCTP, SCTP_STATUS, &status, &status_len) == 0) {
-      LOGE("sctp sendv error %d: %s (connected=%d, len=%zu, ppid=%u, sid=%u) "
-           "status: state=0x%x, rwnd=%u, unack=%u, pend=%u",
-           saved_errno, strerror(saved_errno), sctp->connected, len, ppid, sid,
-           status.sstat_state, status.sstat_rwnd,
-           status.sstat_unackdata, status.sstat_penddata);
+    if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
+      /* Full send buffer under backpressure is NORMAL, not an error — at
+       * least one caller (datachannel_hls.c) retries this exact call on a
+       * 250us poll specifically so a stalled export chunk resumes the
+       * instant the buffer reopens. Logging (and paying for a getsockopt
+       * syscall) on every one of those polls is what turned ordinary
+       * congestion into thousands of ERROR lines/sec and evicted the whole
+       * device diag ring buffer in seconds (bug report 26605007). Fold
+       * repeats into one WARN summary at most once per
+       * SCTP_EAGAIN_LOG_INTERVAL_NS; the getsockopt status query only runs
+       * when a summary is actually about to be emitted. */
+      sctp->send_eagain_suppressed++;
+      int64_t now_ns = sctp_mono_ns();
+      int64_t elapsed_ns = 0;
+      if (sctp_eagain_gate_should_log(sctp->send_eagain_last_log_ns, now_ns,
+                                      SCTP_EAGAIN_LOG_INTERVAL_NS, &elapsed_ns)) {
+        struct sctp_status status;
+        socklen_t status_len = sizeof(status);
+        memset(&status, 0, sizeof(status));
+        double elapsed_s = (double)elapsed_ns / 1e9;
+        if (usrsctp_getsockopt(sctp->sock, IPPROTO_SCTP, SCTP_STATUS, &status, &status_len) == 0) {
+          LOGW("sctp sendv backpressure: %s x%llu in %.1fs (connected=%d, len=%zu, ppid=%u, sid=%u) "
+               "status: state=0x%x, rwnd=%u, unack=%u, pend=%u",
+               strerror(saved_errno), (unsigned long long)sctp->send_eagain_suppressed, elapsed_s,
+               sctp->connected, len, ppid, sid,
+               status.sstat_state, status.sstat_rwnd,
+               status.sstat_unackdata, status.sstat_penddata);
+        } else {
+          LOGW("sctp sendv backpressure: %s x%llu in %.1fs (connected=%d, len=%zu, ppid=%u, sid=%u) "
+               "[getsockopt failed]",
+               strerror(saved_errno), (unsigned long long)sctp->send_eagain_suppressed, elapsed_s,
+               sctp->connected, len, ppid, sid);
+        }
+        sctp->send_eagain_suppressed = 0;
+        sctp->send_eagain_last_log_ns = now_ns;
+      }
     } else {
-      LOGE("sctp sendv error %d: %s (connected=%d, len=%zu, ppid=%u, sid=%u) [getsockopt failed]",
-           saved_errno, strerror(saved_errno), sctp->connected, len, ppid, sid);
+      /* Query SCTP status to understand what's happening */
+      struct sctp_status status;
+      socklen_t status_len = sizeof(status);
+      memset(&status, 0, sizeof(status));
+      if (usrsctp_getsockopt(sctp->sock, IPPROTO_SCTP, SCTP_STATUS, &status, &status_len) == 0) {
+        LOGE("sctp sendv error %d: %s (connected=%d, len=%zu, ppid=%u, sid=%u) "
+             "status: state=0x%x, rwnd=%u, unack=%u, pend=%u",
+             saved_errno, strerror(saved_errno), sctp->connected, len, ppid, sid,
+             status.sstat_state, status.sstat_rwnd,
+             status.sstat_unackdata, status.sstat_penddata);
+      } else {
+        LOGE("sctp sendv error %d: %s (connected=%d, len=%zu, ppid=%u, sid=%u) [getsockopt failed]",
+             saved_errno, strerror(saved_errno), sctp->connected, len, ppid, sid);
+      }
     }
     errno = saved_errno;
   }
