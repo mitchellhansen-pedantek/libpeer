@@ -721,6 +721,64 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
 }
 
+/* How long dtls_srtp_read/_write keep retrying a WANT_* before giving up.
+ * Sized for the condition a retry can actually clear — a momentarily full
+ * socket send buffer — not for a peer that has gone quiet, which no amount of
+ * retrying fixes. Both callers degrade to one dropped packet, which the layer
+ * above retransmits. */
+#define DTLS_SRTP_RETRY_BUDGET_MS 200
+
+/* The shared retry discipline for mbedtls's two entrypoints on this session.
+ *
+ * ssl_mutex serializes them because mbedtls's ssl_context is not thread-safe
+ * in this build (see DtlsSrtp::ssl_mutex). What it must NOT do is stay held
+ * across the retry: mbedtls needs one thread AT A TIME, not one thread until
+ * it is finished, and a WANT_* is by definition a wait on something the
+ * holding thread cannot produce. So the lock is taken per attempt and dropped
+ * before sleeping, which keeps the two operations strictly serialized while
+ * leaving a gap the other one can take.
+ *
+ * `is_write` also selects which returns are retryable — a write retries both
+ * WANT_READ and WANT_WRITE, a read only WANT_WRITE. See the callers. */
+static int dtls_srtp_retry_locked(DtlsSrtp* dtls_srtp, int is_write,
+                                  unsigned char* rbuf, const unsigned char* wbuf,
+                                  size_t len) {
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_nsec += (long)DTLS_SRTP_RETRY_BUDGET_MS * 1000000L;
+  deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+  deadline.tv_nsec %= 1000000000L;
+
+  for (;;) {
+    int ret;
+    struct timespec now;
+
+    pthread_mutex_lock(&dtls_srtp->ssl_mutex);
+    ret = is_write ? mbedtls_ssl_write(&dtls_srtp->ssl, wbuf, len)
+                   : mbedtls_ssl_read(&dtls_srtp->ssl, rbuf, len);
+    pthread_mutex_unlock(&dtls_srtp->ssl_mutex);
+
+    if (is_write) {
+      if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE)
+        return ret;
+    } else {
+      if (ret != MBEDTLS_ERR_SSL_WANT_WRITE) return ret;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > deadline.tv_sec ||
+        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+      return MBEDTLS_ERR_SSL_TIMEOUT;
+
+    /* Yield instead of spinning: whatever clears this is another thread's
+     * work, and a busy loop competes with it for the core. */
+    {
+      struct timespec nap = { 0, 1 * 1000 * 1000 };
+      nanosleep(&nap, NULL);
+    }
+  }
+}
+
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
   int ret;
 
@@ -729,11 +787,21 @@ int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
    * usrsctp's timer thread (calling us via sctp_outgoing_data_cb to emit
    * DATA chunks) races pc_task (calling dtls_srtp_read) on the same ssl
    * ctx. */
-  pthread_mutex_lock(&dtls_srtp->ssl_mutex);
-  do {
-    ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-  pthread_mutex_unlock(&dtls_srtp->ssl_mutex);
+  /* Retry OUTSIDE the lock, not inside it. WANT_READ means mbedtls needs bytes
+   * the peer has not sent yet; the BIO recv is non-blocking, so the retry
+   * cannot make that true — only the peer can, and only via a read this thread
+   * would be holding the lock against. Spinning under the mutex therefore
+   * starved every other user of this session for as long as the peer stayed
+   * quiet, which is how pushing datachannel segments came to freeze the
+   * peer-connection loop's DTLS drain for 25 seconds. Releasing each pass
+   * keeps the two serialized (mbedtls needs one thread at a time, not one
+   * thread forever) while leaving a gap the reader can take.
+   *
+   * The deadline bounds the other half: nothing here can resolve a peer that
+   * has gone away, and the caller (sctp_outgoing_data_cb) treats a failure as
+   * one dropped chunk, which SCTP retransmits. A bounded drop beats an
+   * unbounded hold. */
+  ret = dtls_srtp_retry_locked(dtls_srtp, 1, NULL, buf, len);
 
   /* Anything but a positive byte count is a real failure to encrypt+send.
    * The caller (sctp_outgoing_data_cb on the data-channel path) used to
@@ -751,18 +819,17 @@ int dtls_srtp_read(DtlsSrtp* dtls_srtp, unsigned char* buf, size_t len) {
 
   memset(buf, 0, len);
 
-  pthread_mutex_lock(&dtls_srtp->ssl_mutex);
-  /* Only loop on WANT_WRITE (mbedtls wants to push out an internal record).
-   * WANT_READ means "no more bytes available from BIO recv right now" — at
-   * steady-state that's the normal exit when we've consumed the cached wire
-   * packet, so we must not spin (BIO recv would just keep returning WANT_READ
-   * because the dispatch loop hasn't fed us a fresh packet yet). The outer
-   * dispatch in peer_connection_loop is the natural retry: it iterates per
-   * agent_recv packet and calls dtls_srtp_read fresh each time. */
-  do {
-    ret = mbedtls_ssl_read(&dtls_srtp->ssl, buf, len);
-  } while (ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-  pthread_mutex_unlock(&dtls_srtp->ssl_mutex);
+  /* Retries on WANT_WRITE only (mbedtls wants to push out an internal record),
+   * and outside the lock for the same reason dtls_srtp_write does — a full
+   * socket send buffer is not something this thread can drain while holding
+   * the session against everyone else.
+   *
+   * WANT_READ is NOT retried: it means "no more bytes available from BIO recv
+   * right now", which at steady state is the normal exit once the cached wire
+   * packet is consumed. The outer dispatch in peer_connection_loop is the
+   * natural retry — it iterates per agent_recv packet and calls this fresh
+   * each time. */
+  ret = dtls_srtp_retry_locked(dtls_srtp, 0, buf, NULL, len);
 
   /* Normal end-of-data: BIO had no more bytes to give. Caller treats 0
    * as "no plaintext extracted this call" and moves on. */
