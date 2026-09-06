@@ -159,6 +159,19 @@ void peer_connection_get_session_diag(PeerConnection* pc, char* buf, size_t len)
  * one connection attempt (no ICE restart today), so these are naturally
  * per-attempt counters — cumulative for this pc's Agent, reset at
  * agent_clear_candidates() (agent_create + every fresh offer). */
+/* Why a connection reached PEER_CONNECTION_FAILED. Only ever set on the
+ * transition into FAILED; NONE for a connection that has not failed. */
+typedef enum {
+  PEER_ICE_FAILURE_NONE = 0,
+  PEER_ICE_FAILURE_NO_PAIRS,       /* remote candidate set complete, zero pairs
+                                    * could be formed (every remote candidate
+                                    * unresolvable or address-family-mismatched) */
+  PEER_ICE_FAILURE_CHECKS_FAILED,  /* pairs existed; every connectivity check
+                                    * failed after the remote set was complete  */
+  PEER_ICE_FAILURE_DTLS,           /* ICE selected a pair; the DTLS handshake
+                                    * on it failed                               */
+} PeerIceFailure;
+
 typedef struct {
   uint32_t turn_alloc_ok;         /* TURN Allocate succeeded this attempt        */
   uint32_t turn_alloc_rejected;   /* TURN authenticated Allocate rejected        */
@@ -170,6 +183,15 @@ typedef struct {
   int      selected_remote_type;  /* IceCandidateType of the selected pair's
                                    * remote candidate (0=host,1=srflx,2=prflx,
                                    * 3=relay); -1 = no pair selected yet.        */
+  uint32_t mdns_timed_out;        /* remote .local candidate(s) whose resolve gave
+                                   * up this attempt — the mDNS timeouts that
+                                   * actually happened, not an inference from
+                                   * resolved==0.                               */
+  uint32_t mdns_pending;          /* remote .local candidate(s) still resolving at
+                                   * the moment of the snapshot                  */
+  int      remote_end_of_candidates; /* the remote signalled its candidate set is
+                                   * complete (SDP attribute or trickle message) */
+  PeerIceFailure ice_failure;     /* why FAILED was reached; NONE if it was not  */
   uint32_t dtls_complete_ms;      /* wall-clock ms (ports_get_epoch_time domain,
                                    * same as PeerConnection.dtls_complete_ms) the
                                    * DTLS handshake finished this attempt; 0 = DTLS

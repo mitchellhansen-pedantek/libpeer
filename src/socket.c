@@ -27,7 +27,7 @@ int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
   return 0;
 }
 
-int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
+static int udp_socket_open_opts(UdpSocket* udp_socket, int family, int port, int shared) {
   int ret;
   int reuse = 1;
   struct sockaddr* sa;
@@ -64,6 +64,19 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
     if ((ret = setsockopt(udp_socket->fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))) < 0) {
       LOGW("reuse failed. ignore");
     }
+#ifdef SO_REUSEPORT
+    /* A well-known multicast port (mDNS 5353) is normally already bound by the
+     * host's own resolver (mDNSResponder, avahi). Those bind with SO_REUSEPORT,
+     * and the BSD socket layer only lets a second socket share the port when it
+     * asks the same way — SO_REUSEADDR alone is refused. Without this the async
+     * resolver cannot open at all on such a host and every .local candidate is
+     * silently unresolvable. */
+    if (shared && (ret = setsockopt(udp_socket->fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse))) < 0) {
+      LOGW("reuseport failed. ignore");
+    }
+#else
+    (void)shared;
+#endif
 
     if ((ret = bind(udp_socket->fd, sa, sock_len)) < 0) {
       LOGE("Failed to bind socket: %d", ret);
@@ -92,6 +105,14 @@ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
   }
 
   return 0;
+}
+
+int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
+  return udp_socket_open_opts(udp_socket, family, port, 0);
+}
+
+int udp_socket_open_shared(UdpSocket* udp_socket, int family, int port) {
+  return udp_socket_open_opts(udp_socket, family, port, 1);
 }
 
 int udp_socket_bind_iface(UdpSocket* udp_socket, const char* ifname) {

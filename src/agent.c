@@ -37,7 +37,28 @@ void agent_clear_candidates(Agent* agent) {
   agent->turn_alloc_rejected = 0;
   agent->mdns_resolved = 0;
   agent->mdns_queued = 0;
+  agent->mdns_timed_out = 0;
   agent->selected_remote_type = -1;
+  agent->remote_end_of_candidates = 0;
+}
+
+int agent_mdns_pending(const Agent* agent) {
+  int i, n = 0;
+  for (i = 0; i < AGENT_MAX_PENDING_MDNS; i++) {
+    if (agent->pending_mdns[i].active) n++;
+  }
+  return n;
+}
+
+int agent_ice_exhausted(const Agent* agent) {
+  return agent->remote_end_of_candidates && agent_mdns_pending(agent) == 0;
+}
+
+void agent_set_remote_end_of_candidates(Agent* agent) {
+  if (!agent->remote_end_of_candidates) {
+    LOGI("remote end-of-candidates");
+  }
+  agent->remote_end_of_candidates = 1;
 }
 
 int agent_create(Agent* agent) {
@@ -496,6 +517,7 @@ void agent_poll_mdns_candidates(Agent* agent) {
     }
     p->active = 0;
     if (state < 0) {
+      agent->mdns_timed_out++;
       LOGD("mDNS candidate %s did not resolve; dropped (prflx still covers the direct path)", p->hostname);
       continue;
     }
@@ -702,6 +724,9 @@ void agent_set_remote_description(Agent* agent, char* description) {
 
     } else if (strncmp(line_start, "a=ice-pwd:", strlen("a=ice-pwd:")) == 0) {
       strncpy(agent->remote_upwd, line_start + strlen("a=ice-pwd:"), line_end - line_start - strlen("a=ice-pwd:"));
+
+    } else if (strncmp(line_start, "a=end-of-candidates", strlen("a=end-of-candidates")) == 0) {
+      agent_set_remote_end_of_candidates(agent);
 
     } else if (strncmp(line_start, "a=candidate:", strlen("a=candidate:")) == 0) {
       char mdns_hostname[128];

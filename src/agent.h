@@ -41,7 +41,13 @@ typedef enum AgentMode {
 
 // A remote ".local" (mDNS-obfuscated) candidate parked while its name resolves
 // asynchronously (mdns_async_*). `candidate` is complete except its IP.
-#define AGENT_MAX_PENDING_MDNS 4
+//
+// A parked candidate is a remote candidate that has not been admitted to the
+// table yet, so the park can never legitimately need more slots than the table
+// itself: a browser with several interfaces (a phone: one IPv4 plus a handful
+// of IPv6 privacy addresses) mints one .local name per address per
+// PeerConnection, and every one of them lands here before any can resolve.
+#define AGENT_MAX_PENDING_MDNS AGENT_MAX_CANDIDATES
 
 typedef struct AgentPendingMdns {
   int active;
@@ -124,7 +130,30 @@ struct Agent {
                                    * candidate once agent_connectivity_check commits
                                    * (host=0/srflx=1/prflx=2/relay=3); -1 = not yet
                                    * selected for this attempt. */
+  uint32_t mdns_timed_out;        /* remote .local candidates whose resolve gave up
+                                   * (MDNS_TOTAL_TIMEOUT_MS elapsed) this attempt.   */
+
+  /* RFC 8838 (trickle ICE) and RFC 8445 §6.1.2.3: the remote's candidate set is COMPLETE only
+   * once it has said so — `a=end-of-candidates` in its description, or the
+   * end-of-candidates trickle message. Until then an empty or fully-failed
+   * check list is "nothing to check yet", not failure; more candidates may
+   * still be on the wire (a browser trickles its srflx/relay after its host
+   * candidates, and after its answer). Set by agent_set_remote_description /
+   * agent_set_remote_end_of_candidates; reset per attempt. */
+  int      remote_end_of_candidates;
 };
+
+/* 1 when no further remote candidate can arrive: the remote has signalled
+ * end-of-candidates AND no parked .local candidate is still resolving. Only
+ * then may a check list with no succeeded/in-progress pair be declared
+ * failed (peer_connection_loop). */
+int agent_ice_exhausted(const Agent* agent);
+
+/* Count of parked .local candidates still awaiting resolution. */
+int agent_mdns_pending(const Agent* agent);
+
+/* Record the remote's end-of-candidates signal (trickle form). */
+void agent_set_remote_end_of_candidates(Agent* agent);
 
 void agent_gather_candidate(Agent* agent, const char* urls, const char* username, const char* credential);
 
