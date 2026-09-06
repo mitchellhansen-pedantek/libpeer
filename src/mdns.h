@@ -38,4 +38,7 @@ void mdns_async_poll(void);
 // untouched), 0 = still pending, -1 = failed/expired/never requested.
 int mdns_async_lookup(const char* hostname, Address* addr);
 
+/* Current capacity of the shared async resolver table (grows on demand). */
+int mdns_async_capacity(void);
+
 #endif  // MDNS_H_

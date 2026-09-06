@@ -15,6 +15,11 @@ typedef struct TcpSocket {
 
 int udp_socket_open(UdpSocket* udp_socket, int family, int port);
 
+/* As udp_socket_open, but the port may already be held by another process
+ * (SO_REUSEPORT): for a well-known multicast port such as mDNS's 5353, which
+ * the host's own resolver usually owns. */
+int udp_socket_open_shared(UdpSocket* udp_socket, int family, int port);
+
 /* Pin an already-open socket to a single interface via SO_BINDTODEVICE so all
  * traffic ingresses/egresses on that NIC regardless of the routing table.
  * ifname NULL/empty is a no-op (returns 0). On non-Linux platforms (no

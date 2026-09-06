@@ -63,6 +63,7 @@ typedef struct {
 struct PeerConnection {
   PeerConfiguration config;
   PeerConnectionState state;
+  PeerIceFailure ice_failure;   /* set on the transition into FAILED; see peer_connection.h */
   Agent agent;
   DtlsSrtp dtls_srtp;
   Sctp sctp;
@@ -979,6 +980,10 @@ void peer_connection_get_diag(PeerConnection* pc, PeerConnectionDiag* out) {
   out->turn_alloc_rejected = pc->agent.turn_alloc_rejected;
   out->mdns_resolved = pc->agent.mdns_resolved;
   out->mdns_queued = pc->agent.mdns_queued;
+  out->mdns_timed_out = pc->agent.mdns_timed_out;
+  out->mdns_pending = (uint32_t)agent_mdns_pending(&pc->agent);
+  out->remote_end_of_candidates = pc->agent.remote_end_of_candidates;
+  out->ice_failure = pc->ice_failure;
   out->selected_remote_type = pc->agent.selected_remote_type;
   out->dtls_complete_ms = pc->dtls_complete_ms;
 }
@@ -1229,7 +1234,24 @@ int peer_connection_loop(PeerConnection* pc) {
 
     case PEER_CONNECTION_CHECKING:
       if (agent_select_candidate_pair(&pc->agent) < 0) {
-        STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        /* Nothing succeeded and nothing is in progress. That is failure ONLY
+         * once no further remote candidate can arrive (RFC 8838): the remote
+         * has sent end-of-candidates and no .local name is still resolving.
+         * Before that it is an empty check list — the browser's answer
+         * routinely lands before its srflx/relay trickle does, and the
+         * trickled candidate is paired the moment it arrives
+         * (peer_connection_add_ice_candidate). The wait is bounded by the
+         * caller's gather timeout, not by this loop. */
+        if (agent_ice_exhausted(&pc->agent)) {
+          pc->ice_failure = (pc->agent.candidate_pairs_num == 0)
+                                ? PEER_ICE_FAILURE_NO_PAIRS
+                                : PEER_ICE_FAILURE_CHECKS_FAILED;
+          LOGI("ICE failed: %s (pairs=%d)",
+               pc->ice_failure == PEER_ICE_FAILURE_NO_PAIRS ? "no candidate pairs"
+                                                             : "all checks failed",
+               pc->agent.candidate_pairs_num);
+          STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        }
       } else if (agent_connectivity_check(&pc->agent) == 0) {
         pc->b_dtls_handshake_logged = 0;  /* fresh handshake attempt: re-arm the once-only log below */
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
@@ -1288,6 +1310,7 @@ int peer_connection_loop(PeerConnection* pc) {
       } else {
         /* DTLS handshake failed - move to FAILED state to stop retrying */
         LOGE("DTLS handshake failed with error %d, connection failed", dtls_ret);
+        pc->ice_failure = PEER_ICE_FAILURE_DTLS;
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
       break;
@@ -1763,10 +1786,25 @@ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid) {
   return NULL;  // Not found
 }
 
+/* JSEP/RFC 8838 end-of-candidates in its trickle forms: an empty candidate
+ * string (what RTCPeerConnection.onicecandidate's null candidate becomes on
+ * the wire), or the SDP attribute's name with or without its "a=" prefix. */
+static int is_end_of_candidates(const char* candidate) {
+  if (candidate[0] == '\0') return 1;
+  if (strncmp(candidate, "a=", 2) == 0) candidate += 2;
+  return strcmp(candidate, "end-of-candidates") == 0;
+}
+
 int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
   Agent* agent = &pc->agent;
   char mdns_hostname[128];
   int parsed, i;
+
+  if (!candidate) return -1;
+  if (is_end_of_candidates(candidate)) {
+    agent_set_remote_end_of_candidates(agent);
+    return 0;
+  }
 
   if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES) {
     LOGW("Remote candidate table full; ignoring trickled candidate");

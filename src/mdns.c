@@ -139,7 +139,7 @@ int mdns_resolve_addr(const char* hostname, Address* addr) {
   int size, ret;
   uint64_t deadline, next_send, now, wait_until, wait_ms;
 
-  if (udp_socket_open(&udp_socket, AF_INET, MDNS_PORT) < 0) {
+  if (udp_socket_open_shared(&udp_socket, AF_INET, MDNS_PORT) < 0) {
     LOGE("Failed to create socket");
     return 0;  // 0 == unresolved (callers treat non-zero as success)
   }
@@ -204,9 +204,20 @@ int mdns_resolve_addr(const char* hostname, Address* addr) {
 
 // ── Async resolver (see mdns.h) ─────────────────────────────────────────────
 // One shared 5353 multicast socket, opened while any query is pending, plus a
-// small state table. Everything runs on the caller's (reactor) thread.
+// state table. Everything runs on the caller's (reactor) thread.
+//
+// The table is shared by every Agent in the process and sized by demand: it
+// starts at MDNS_ASYNC_INITIAL entries and doubles when full, up to
+// MDNS_ASYNC_HARD_MAX. Demand is bounded upstream — each Agent parks at most
+// AGENT_MAX_PENDING_MDNS names — so the ceiling is a guard against a runaway
+// peer, not a working limit. A fixed table was the failure this replaces: at 8
+// entries, seven viewers on one gateway (a phone mints one .local name per
+// address per PeerConnection) overflowed it in the first 200 ms of an offer
+// batch and every later name was dropped, unresolvable for the life of the
+// session.
 
-#define MDNS_ASYNC_MAX 8
+#define MDNS_ASYNC_INITIAL 8
+#define MDNS_ASYNC_HARD_MAX 1024
 #define MDNS_ASYNC_CACHE_MS 30000  /* keep a result this long for late lookups */
 #define MDNS_ASYNC_FAIL_CACHE_MS 5000
 
@@ -226,16 +237,35 @@ typedef struct {
   uint64_t expire_at;   /* RESOLVED/FAILED: free the slot at this time */
 } MdnsAsyncEntry;
 
-static MdnsAsyncEntry g_mdns_entries[MDNS_ASYNC_MAX];
+static MdnsAsyncEntry* g_mdns_entries = NULL;
+static int g_mdns_cap = 0;
 static UdpSocket g_mdns_async_socket;
 static int g_mdns_async_socket_open = 0;
+
+/* Grow the table (or create it). Returns 0 on success, -1 at the ceiling or on
+ * allocation failure; the existing entries are untouched on failure. */
+static int mdns_async_grow(void) {
+  int new_cap = g_mdns_cap ? g_mdns_cap * 2 : MDNS_ASYNC_INITIAL;
+  if (new_cap > MDNS_ASYNC_HARD_MAX) new_cap = MDNS_ASYNC_HARD_MAX;
+  if (new_cap <= g_mdns_cap) return -1;
+  MdnsAsyncEntry* grown = realloc(g_mdns_entries, (size_t)new_cap * sizeof(*grown));
+  if (!grown) return -1;
+  memset(grown + g_mdns_cap, 0, (size_t)(new_cap - g_mdns_cap) * sizeof(*grown));
+  g_mdns_entries = grown;
+  g_mdns_cap = new_cap;
+  return 0;
+}
+
+int mdns_async_capacity(void) {
+  return g_mdns_cap;
+}
 
 static int mdns_async_ensure_socket(void) {
   Address mcast_addr = {0};
   if (g_mdns_async_socket_open) {
     return 0;
   }
-  if (udp_socket_open(&g_mdns_async_socket, AF_INET, MDNS_PORT) < 0) {
+  if (udp_socket_open_shared(&g_mdns_async_socket, AF_INET, MDNS_PORT) < 0) {
     LOGE("mdns-async: failed to open socket");
     return -1;
   }
@@ -254,7 +284,7 @@ int mdns_async_request(const char* hostname) {
   int i, free_slot = -1;
   uint64_t now = mdns_now_ms();
 
-  for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+  for (i = 0; i < g_mdns_cap; i++) {
     MdnsAsyncEntry* e = &g_mdns_entries[i];
     if (e->state != MDNS_ENTRY_FREE && strcmp(e->hostname, hostname) == 0) {
       return 0;  /* already pending or cached */
@@ -264,8 +294,11 @@ int mdns_async_request(const char* hostname) {
     }
   }
   if (free_slot < 0) {
-    LOGW("mdns-async: pending table full, dropping %s", hostname);
-    return -1;
+    if (mdns_async_grow() != 0) {
+      LOGW("mdns-async: resolver table at its ceiling (%d), dropping %s", g_mdns_cap, hostname);
+      return -1;
+    }
+    free_slot = i;  /* first entry of the newly grown region */
   }
   if (mdns_async_ensure_socket() != 0) {
     return -1;
@@ -290,7 +323,7 @@ void mdns_async_poll(void) {
   uint64_t now = mdns_now_ms();
   int i, ret, size, any_pending = 0;
 
-  for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+  for (i = 0; i < g_mdns_cap; i++) {
     MdnsAsyncEntry* e = &g_mdns_entries[i];
     switch (e->state) {
       case MDNS_ENTRY_PENDING:
@@ -340,7 +373,7 @@ void mdns_async_poll(void) {
     if (ret <= 0) {
       break;
     }
-    for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+    for (i = 0; i < g_mdns_cap; i++) {
       MdnsAsyncEntry* e = &g_mdns_entries[i];
       if (e->state != MDNS_ENTRY_PENDING) {
         continue;
@@ -365,7 +398,7 @@ void mdns_async_poll(void) {
 
 int mdns_async_lookup(const char* hostname, Address* addr) {
   int i;
-  for (i = 0; i < MDNS_ASYNC_MAX; i++) {
+  for (i = 0; i < g_mdns_cap; i++) {
     MdnsAsyncEntry* e = &g_mdns_entries[i];
     if (e->state == MDNS_ENTRY_FREE || strcmp(e->hostname, hostname) != 0) {
       continue;
