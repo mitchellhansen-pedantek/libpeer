@@ -191,6 +191,9 @@ typedef struct {
                                    * the moment of the snapshot                  */
   int      remote_end_of_candidates; /* the remote signalled its candidate set is
                                    * complete (SDP attribute or trickle message) */
+  uint32_t candidate_pairs;       /* pairs in the check list right now; one per
+                                   * (local, remote), so a remote that arrived
+                                   * both trickled and in the answer counts once */
   PeerIceFailure ice_failure;     /* why FAILED was reached; NONE if it was not  */
   uint32_t dtls_complete_ms;      /* wall-clock ms (ports_get_epoch_time domain,
                                    * same as PeerConnection.dtls_complete_ms) the

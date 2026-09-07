@@ -443,10 +443,26 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg) {
  * existing pairs and the selected/nominated_pair pointers into the array are
  * untouched, so this is safe while connectivity checks are in flight. New
  * pairs start FROZEN and are picked up by the normal check pump. */
+/* One pair per (local, remote). A remote candidate can reach the agent twice —
+ * trickled, then again inside the answer — and pairing it twice puts identical
+ * checks in the AGENT_MAX_INPROGRESS slots, starving candidates paired later. */
+static int agent_pair_exists(const Agent* agent, const IceCandidate* local, const IceCandidate* remote) {
+  int i;
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].local == local && agent->candidate_pairs[i].remote == remote) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 void agent_pair_remote_candidate(Agent* agent, IceCandidate* remote) {
   int i;
   for (i = 0; i < agent->local_candidates_count; i++) {
     if (agent->local_candidates[i].addr.family != remote->addr.family) {
+      continue;
+    }
+    if (agent_pair_exists(agent, &agent->local_candidates[i], remote)) {
       continue;
     }
     if (agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
@@ -645,23 +661,38 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
   }
 }
 
+/* A Binding Response is evidence about exactly one address: the one it came
+ * from. Every pair whose remote is that address succeeds, whatever state it
+ * was in. A FROZEN pair can legitimately be answered — the triggered check in
+ * agent_process_stun_request goes straight to the requester's address, which
+ * may be a candidate paired after the in-progress slots filled — and that
+ * answer is proof the path works, not a stray to be ignored.
+ *
+ * A response that matches no pair credits nothing. Crediting nominated_pair
+ * instead marked a pair SUCCEEDED for a path that had never answered; the
+ * agent then committed to it and sent every DTLS flight to a dead address. */
 void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr) {
   int i;
+  int matched = 0;
   switch (stun_msg->stunmethod) {
     case STUN_METHOD_BINDING:
       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0) {
-        // Find the pair that matches this response's source address
         for (i = 0; i < agent->candidate_pairs_num; i++) {
-          if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS &&
-              addr_equal(&agent->candidate_pairs[i].remote->addr, from_addr)) {
-            agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_SUCCEEDED;
-            LOGI("STUN response matched pair %d", i);
-            return;
+          IceCandidatePair* pair = &agent->candidate_pairs[i];
+          if (!addr_equal(&pair->remote->addr, from_addr)) {
+            continue;
+          }
+          matched++;
+          if (pair->state != ICE_CANDIDATE_STATE_SUCCEEDED) {
+            LOGI("STUN response matched pair %d%s", i,
+                 pair->state == ICE_CANDIDATE_STATE_INPROGRESS ? "" : " (not in progress)");
+            pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
           }
         }
-        // Fallback to nominated_pair for backwards compatibility
-        if (agent->nominated_pair) {
-          agent->nominated_pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+        if (matched == 0) {
+          char addr_string[ADDRSTRLEN];
+          addr_to_string(from_addr, addr_string, sizeof(addr_string));
+          LOGD("STUN response from %s:%d matches no pair; ignored", addr_string, from_addr->port);
         }
       }
       break;
@@ -777,7 +808,9 @@ void agent_update_candidate_pairs(Agent* agent) {
   LOGI("Updating candidate pairs: local=%d, remote=%d", agent->local_candidates_count, agent->remote_candidates_count);
   for (i = 0; i < agent->local_candidates_count; i++) {
     for (j = 0; j < agent->remote_candidates_count; j++) {
-      if (agent->local_candidates[i].addr.family == agent->remote_candidates[j].addr.family) {
+      if (agent->local_candidates[i].addr.family == agent->remote_candidates[j].addr.family &&
+          !agent_pair_exists(agent, &agent->local_candidates[i], &agent->remote_candidates[j]) &&
+          agent->candidate_pairs_num < AGENT_MAX_CANDIDATE_PAIRS) {
         agent->candidate_pairs[agent->candidate_pairs_num].local = &agent->local_candidates[i];
         agent->candidate_pairs[agent->candidate_pairs_num].remote = &agent->remote_candidates[j];
         agent->candidate_pairs[agent->candidate_pairs_num].priority = agent->local_candidates[i].priority + agent->remote_candidates[j].priority;
