@@ -552,7 +552,7 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (now.tv_sec > dtls_srtp->hs_deadline.tv_sec ||
         (now.tv_sec == dtls_srtp->hs_deadline.tv_sec && now.tv_nsec >= dtls_srtp->hs_deadline.tv_nsec)) {
-      LOGE("DTLS handshake timed out after %d seconds (no ClientHello from browser)", DTLS_HANDSHAKE_TIMEOUT_S);
+      LOGE("DTLS handshake timed out after %d seconds (peer never completed its flights on the selected pair)", DTLS_HANDSHAKE_TIMEOUT_S);
       return MBEDTLS_ERR_SSL_TIMEOUT;
     }
     return DTLS_SRTP_HS_WANT;

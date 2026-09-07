@@ -983,6 +983,7 @@ void peer_connection_get_diag(PeerConnection* pc, PeerConnectionDiag* out) {
   out->mdns_timed_out = pc->agent.mdns_timed_out;
   out->mdns_pending = (uint32_t)agent_mdns_pending(&pc->agent);
   out->remote_end_of_candidates = pc->agent.remote_end_of_candidates;
+  out->candidate_pairs = (uint32_t)pc->agent.candidate_pairs_num;
   out->ice_failure = pc->ice_failure;
   out->selected_remote_type = pc->agent.selected_remote_type;
   out->dtls_complete_ms = pc->dtls_complete_ms;

@@ -198,6 +198,10 @@ int agent_add_prflx_candidate(Agent* agent, Address* addr);
 // sits in the (partially unsorted) pair array.
 IceCandidatePair* agent_best_succeeded_pair(Agent* agent);
 
+/* Credit every pair whose remote is `from_addr` with a validated Binding
+ * Response; a response from an address no pair names credits nothing. */
+void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* from_addr);
+
 int agent_select_candidate_pair(Agent* agent);
 
 int agent_connectivity_check(Agent* agent);
