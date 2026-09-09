@@ -637,7 +637,13 @@ void sctp_usrsctp_deinit() {
 }
 
 int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
-  LOGD("SCTP-LIFE create a=%p", (void*)sctp);   /* TEMP INSTRUMENT (wedge triage) */
+  /* Association lifecycle, at INFO: one line per create, one per destroy. This
+   * is the only record of when SCTP started for a given association, and
+   * pairing it with the SCTP_COMM_UP that carries the same a= is how the
+   * handshake's recovery latency is measured after a dropped DTLS final flight
+   * (frontend/e2e/webrtc-dtls-final-flight-repro.spec.ts). At DEBUG it is
+   * compiled out of every shipped build, which leaves that unmeasurable. */
+  LOGI("SCTP-LIFE create a=%p", (void*)sctp);
   sctp->dtls_srtp = dtls_srtp;
   sctp->local_port = 5000;
   sctp->remote_port = 5000;
@@ -802,7 +808,7 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
 }
 
 void sctp_destroy_association(Sctp* sctp) {
-  LOGD("SCTP-LIFE destroy a=%p connected=%d", (void*)sctp, sctp ? sctp->connected : -1);  /* TEMP INSTRUMENT */
+  LOGI("SCTP-LIFE destroy a=%p connected=%d", (void*)sctp, sctp ? sctp->connected : -1);
 #if CONFIG_USE_USRSCTP
   if (sctp && sctp->sock) {
     /* Acquire mutex before closing to prevent race with ongoing sends */
