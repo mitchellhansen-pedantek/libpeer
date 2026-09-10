@@ -212,6 +212,32 @@ int main(void) {
   CHECK(feed(pc, tx_fd, &dst, rec, n, out, sizeof(out)) ==
         DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN + 1459);
 
+  // ── The e2e fault injector induces exactly this ─────────────────────────
+  // peer_connection_test_arm_clienthello_drop() is what the
+  // "drop_clienthello_head" MQTT control action arms, so the e2e reproducer
+  // and this unit test exercise one mechanism. If the hook stopped dropping,
+  // the e2e would quietly prove nothing; this fails instead.
+  peer_connection_test_arm_clienthello_drop(1);
+
+  n = build_ch_fragment(rec, 6, 1491, 0, 1383);
+  CHECK(feed(pc, tx_fd, &dst, rec, n, out, sizeof(out)) == MBEDTLS_ERR_SSL_WANT_READ);
+
+  // The tail arrives with no head — the field shape.
+  n = build_ch_fragment(rec, 6, 1491, 1383, 108);
+  CHECK(feed(pc, tx_fd, &dst, rec, n, out, sizeof(out)) == MBEDTLS_ERR_SSL_WANT_READ);
+
+  // The peer retransmits its flight and the message completes, head and tail
+  // both intact.
+  n = build_ch_fragment(rec, 6, 1491, 0, 1383);
+  int after_drop = feed(pc, tx_fd, &dst, rec, n, out, sizeof(out));
+  CHECK(after_drop == DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN + 1491);
+  if (after_drop == DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN + 1491) {
+    const uint8_t* body = out + DTLS_RECORD_HEADER_LEN + DTLS_HANDSHAKE_HEADER_LEN;
+    CHECK(body[0] == 0x00);
+    CHECK(body[1383] == (uint8_t)(1383 & 0xFF));
+    CHECK(body[1490] == (uint8_t)(1490 & 0xFF));
+  }
+
   close(tx_fd);
   peer_connection_destroy(pc);
   peer_deinit();
