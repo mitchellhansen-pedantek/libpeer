@@ -218,6 +218,12 @@ void* peer_connection_get_sctp(PeerConnection* pc);
  * device. */
 void peer_connection_test_arm_flight_drop(int count);
 
+/* Test-only: drop the next `count` inbound ClientHello fragments carrying
+ * offset 0, leaving the peer's hello to arrive tail-first with its head
+ * missing. Wired to the "drop_clienthello_head" MQTT control action; never
+ * called on a real device. */
+void peer_connection_test_arm_clienthello_drop(int count);
+
 PeerConnection* peer_connection_create(PeerConfiguration* config);
 
 void peer_connection_destroy(PeerConnection* pc);

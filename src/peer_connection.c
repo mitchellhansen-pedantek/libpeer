@@ -629,6 +629,16 @@ static uint32_t dtls_frag_mark(dtls_fragment_state_t* frag, uint32_t offset, uin
   return newly;
 }
 
+/* Test-only: armed by peer_connection_test_arm_clienthello_drop(count) (wired to
+ * the SDK_LOCAL_TEST_DRIVER MQTT control action "drop_clienthello_head"). Drops
+ * the next `count` INBOUND ClientHello fragments carrying offset 0, so the peer's
+ * next hello arrives tail-first with its head missing — the field shape from bug
+ * report a655c70e, where the head was lost on the relay path. Recovery is the
+ * peer's own flight retransmit; a reassembler that cannot hold the orphan tail
+ * fails the handshake instead and never gets there. Never set on a real device. */
+static volatile int g_test_ch_drop_remaining = 0;
+void peer_connection_test_arm_clienthello_drop(int count) { g_test_ch_drop_remaining = count; }
+
 static uint32_t read_uint24_be(const uint8_t* p) {
   return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
 }
@@ -759,6 +769,13 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
 
   /* Fragmented ClientHello - need to reassemble */
   LOGI("ClientHello fragmented: offset=%u, len=%u, total=%u", frag_offset, frag_len, hs_total_len);
+
+  if (g_test_ch_drop_remaining > 0 && frag_offset == 0) {
+    g_test_ch_drop_remaining--;
+    LOGW("TEST: dropping inbound ClientHello head (total=%u, %d left) — simulating loss",
+         hs_total_len, g_test_ch_drop_remaining);
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
 
   /* A fragment that cannot be placed is dropped, never forwarded. Handing
    * mbedtls a record whose handshake header says "bytes N..M of a larger
