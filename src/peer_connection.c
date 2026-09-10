@@ -603,14 +603,31 @@ static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void
 /* Fragment reassembly state - stored per-connection to support multiple peers */
 struct dtls_fragment_state_s {
   uint8_t data[DTLS_MAX_HANDSHAKE_SIZE];
-  uint32_t total_len;        /* Expected total handshake message length */
-  uint32_t received_len;     /* Bytes received so far */
-  uint16_t msg_seq;          /* Message sequence number */
-  uint8_t version[2];        /* DTLS version from first fragment */
-  uint8_t epoch[2];          /* Epoch from first fragment */
-  uint8_t seq_num[6];        /* Sequence number from first fragment */
-  int active;                /* Reassembly in progress */
+  uint8_t covered[DTLS_MAX_HANDSHAKE_SIZE / 8]; /* Which bytes have arrived */
+  uint32_t total_len;                           /* Expected total handshake message length */
+  uint32_t received_len;                        /* Distinct bytes received so far */
+  uint16_t msg_seq;                             /* Message sequence number */
+  uint8_t version[2];                           /* DTLS version from the message-start fragment */
+  uint8_t epoch[2];                             /* Epoch from the message-start fragment */
+  uint8_t seq_num[6];                           /* Sequence number from the message-start fragment */
+  int have_header;                              /* Record header captured (offset 0 has arrived) */
+  int active;                                   /* Reassembly in progress */
 };
+
+/* Mark [offset, offset+len) delivered and return how many bytes that newly
+ * covered. A retransmitted or overlapping fragment contributes only whatever
+ * it is the first to deliver. */
+static uint32_t dtls_frag_mark(dtls_fragment_state_t* frag, uint32_t offset, uint32_t len) {
+  uint32_t newly = 0;
+  for (uint32_t i = offset; i < offset + len; i++) {
+    uint8_t bit = (uint8_t)(1u << (i & 7));
+    if (!(frag->covered[i >> 3] & bit)) {
+      frag->covered[i >> 3] |= bit;
+      newly++;
+    }
+  }
+  return newly;
+}
 
 static uint32_t read_uint24_be(const uint8_t* p) {
   return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
@@ -743,53 +760,56 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   /* Fragmented ClientHello - need to reassemble */
   LOGI("ClientHello fragmented: offset=%u, len=%u, total=%u", frag_offset, frag_len, hs_total_len);
 
-  /* Check if this is the start of a new message */
-  if (frag_offset == 0) {
-    /* Start new reassembly */
+  /* A fragment that cannot be placed is dropped, never forwarded. Handing
+   * mbedtls a record whose handshake header says "bytes N..M of a larger
+   * message" makes it parse the middle of a ClientHello as a whole one and
+   * fail the handshake outright with MBEDTLS_ERR_SSL_DECODE_ERROR, which no
+   * DTLS retransmission can undo — the connection is already failed. Dropping
+   * leaves the peer's own flight retransmit free to deliver the message
+   * again. */
+  if (hs_total_len > DTLS_MAX_HANDSHAKE_SIZE - DTLS_HANDSHAKE_HEADER_LEN ||
+      frag_offset + frag_len > hs_total_len) {
+    LOGE("ClientHello fragment out of range (offset=%u len=%u total=%u) - dropping",
+         frag_offset, frag_len, hs_total_len);
+    frag->active = 0;
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+
+  /* Fragments of one flight may arrive in any order, and the fragment holding
+   * offset 0 is not guaranteed to come first, so any fragment of a message we
+   * are not already assembling starts the reassembly wherever it lands. */
+  if (!frag->active || hs_msg_seq != frag->msg_seq || hs_total_len != frag->total_len) {
     memset(frag, 0, sizeof(*frag));
     frag->active = 1;
     frag->total_len = hs_total_len;
     frag->msg_seq = hs_msg_seq;
-    /* Save record header fields for reconstruction */
-    memcpy(frag->version, recv_buf + 1, 2);
-    memcpy(frag->epoch, recv_buf + 3, 2);
-    memcpy(frag->seq_num, recv_buf + 5, 6);
     LOGI("Starting ClientHello reassembly, total_len=%u", hs_total_len);
   }
 
-  /* Validate this fragment belongs to current reassembly */
-  if (!frag->active || hs_msg_seq != frag->msg_seq || hs_total_len != frag->total_len) {
-    LOGW("Fragment mismatch, resetting");
-    frag->active = 0;
-    memcpy(buf, recv_buf, ret);
-    return ret;
-  }
-
-  /* Bounds check */
-  if (frag_offset + frag_len > frag->total_len) {
-    LOGE("Fragment exceeds total length");
-    frag->active = 0;
-    memcpy(buf, recv_buf, ret);
-    return ret;
-  }
-
-  if (frag_offset + frag_len > DTLS_MAX_HANDSHAKE_SIZE - DTLS_HANDSHAKE_HEADER_LEN) {
-    LOGE("Handshake message too large for reassembly buffer");
-    frag->active = 0;
-    memcpy(buf, recv_buf, ret);
-    return ret;
+  /* The reconstructed record carries the header of the fragment that holds the
+   * start of the message. Completion requires offset 0, so this is always set
+   * by the time the message is handed on. */
+  if (frag_offset == 0) {
+    memcpy(frag->version, recv_buf + 1, 2);
+    memcpy(frag->epoch, recv_buf + 3, 2);
+    memcpy(frag->seq_num, recv_buf + 5, 6);
+    frag->have_header = 1;
   }
 
   /* Copy fragment data (handshake payload, after 12-byte handshake header) */
   const uint8_t* frag_data = hs + DTLS_HANDSHAKE_HEADER_LEN;
   memcpy(frag->data + DTLS_HANDSHAKE_HEADER_LEN + frag_offset, frag_data, frag_len);
-  frag->received_len += frag_len;
+  /* Count only the bytes this fragment is the first to deliver. Summing
+   * fragment lengths lets two overlapping fragments reach the total while the
+   * message still has a hole, and that hole then ships to mbedtls inside a
+   * well-formed-looking ClientHello. */
+  frag->received_len += dtls_frag_mark(frag, frag_offset, frag_len);
 
   LOGI("Received fragment: offset=%u, len=%u, total_received=%u/%u",
        frag_offset, frag_len, frag->received_len, frag->total_len);
 
   /* Check if reassembly is complete */
-  if (frag->received_len >= frag->total_len) {
+  if (frag->received_len == frag->total_len && frag->have_header) {
     LOGI("ClientHello reassembly complete (%u bytes)", frag->total_len);
 
     /* Build the complete handshake header */
